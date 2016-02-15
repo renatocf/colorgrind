@@ -1,0 +1,280 @@
+#!/usr/bin/perl
+
+# pragmas
+use strict;
+use warnings;
+
+# Modules
+use Term::ANSIColor qw(:constants);
+local $Term::ANSIColor::AUTORESET = 1;
+
+# Constants
+use constant COLUMNS => ( grep defined, ($ENV{COLUMNS}, `tput cols`, 80) )[0];
+
+################################################################################
+##                                   REGEXES                                  ##
+################################################################################
+
+my $cpp_grammar = qr(
+  (?(DEFINE)
+     (?<_ID_>               [A-Za-z_][A-Za-z0-9_]* )
+     (?<_TYPENAME_>         (?: typename ) )
+     (?<_CV_QUALIFIER_>     (?: const | volatile ) )
+     (?<_NAMESPACE_>        (?:\:\:)? (?:(?&_ID_)\:\:)+ )
+     (?<_OPERATOR_>         (?: \& | \&\& | \* ) )
+     (?<_DEPENDENT_>        (?:\:\:(?&_ID_))+ )
+     (?<_TEMPLATE_>         < \s* (?&_TYPELIST_)? \s* > )
+     (?<_VOID_TYPE_>        void )
+     (?<_BOOL_TYPE_>        bool )
+     (?<_NULLPTR_TYPE_>     nullptr_t )
+     (?<_SIGN_>             (?: signed | unsigned ) )
+     (?<_CHAR_TYPE_>        (?:
+                              (?: (?&_SIGN_) \s+ )? char
+                              |
+                              wchar_t
+                              |
+                              char\d\d_t
+                            ) )
+     (?<_INTEGRAL_TYPE_>    (?: (?&_SIGN_) \s+ )?
+                              (?:
+                                int
+                                |
+                                (?: short | long | long \s+ long )
+                                |
+                                (?: short | long | long \s+ long ) \s+ int
+                              ) )
+     (?<_FLOAT_TYPE_>       (?: float | double | long \s+ double ) )
+     (?<_FUNDAMENTAL_TYPE_> (?:
+                              (?&_VOID_TYPE_) | (?&_BOOL_TYPE_)
+                              |
+                              (?&_NULLPTR_TYPE_) | (?&_CHAR_TYPE_)
+                              |
+                              (?&_INTEGRAL_TYPE_) | (?&_FLOAT_TYPE_)
+                            ) )
+     (?<_CLASS_TYPE_>       (?&_TYPENAME_)? (?&_NAMESPACE_)? (?&_ID_)
+                              (?&_TEMPLATE_)? (?&_DEPENDENT_)? )
+     (?<_QUALIFIED_TYPE_>   (?: (?&_FUNDAMENTAL_TYPE_) | (?&_CLASS_TYPE_) )
+                              (?: \s+ (?&_CV_QUALIFIER_) )? )
+     (?<_TYPE_>             (?: (?&_QUALIFIED_TYPE_) \s* (?&_OPERATOR_)? ) )
+     (?<_TYPELIST_>         (?&_TYPE_) (?: \s* , \s* (?&_TYPE_))* )
+  )
+)x;
+
+my $cpp_type = qr(
+  ( (?&_TYPE_) )
+  $cpp_grammar
+)x;
+
+my $cpp_operator_overload = qr(
+  (?<NAME>
+    operator
+    \s+
+    (
+      [^\W]{1,3}
+      |
+      (?:new|delete) \s+ (?:\[\])?
+      |
+      (&_TYPE_)
+    )
+  )
+  \s+
+  \(\s* (?<PARAMETER_TYPE_LIST> (?&_TYPE_) (?: \s* , \s* (?&_TYPE_) )* )? \s*\)
+  $cpp_grammar
+)x;
+
+my $cpp_function_signature = qr(
+  (?<RETURN_TYPE> (?&_TYPE_) \s )?
+  \s*
+  (?<NAMESPACE> (?&_NAMESPACE_) )?
+  (?<NAME> (?&_ID_) )
+  \s*
+  (?:
+    <\s* (?<TEMPLATE_TYPE_LIST> (?&_TYPE_) (?: \s* , \s* (?&_TYPE_) )* )? \s*>
+  )?
+  \s*
+  \(\s* (?<PARAMETER_TYPE_LIST> (?&_TYPE_) (?: \s* , \s* (?&_TYPE_) )* )? \s*\)
+  (?:
+    (?<QUALIFIER> \s+ (?&_CV_QUALIFIER_)? )
+  )?
+  $cpp_grammar
+)x;
+
+my $demangled_string_regex = qr(
+    std(?:\:\:__cxx\d\d)?\:\:basic_string<
+      \s* char,
+      \s* std\:\:char_traits<char>,
+      \s* std\:\:allocator<char>
+    \s* >
+)x;
+
+my $allocator_regex = qr(std::allocator<.*>)x;
+
+################################################################################
+##                                   REGEXES                                  ##
+################################################################################
+
+my ($program_output, $valgrind_output) = (0, 1);
+my ($prev_output, $curr_output) = ($valgrind_output, $valgrind_output);
+
+open VALGRIND, "-|", "valgrind 2>&1 @ARGV"
+    // die "Cannot open valgrind! $!";
+
+my $program   = <VALGRIND>;
+my $copyright = <VALGRIND>;
+my $info      = <VALGRIND>;
+
+print BOLD ON_BRIGHT_BLACK $program;
+print BOLD ON_BRIGHT_BLACK $copyright;
+print BOLD ON_BRIGHT_BLACK $info;
+
+while (<VALGRIND>)
+{
+    $prev_output = $curr_output;
+    $curr_output = (m/^==\d+==/) ? $valgrind_output : $program_output;
+
+    print BOLD "#" x COLUMNS, "\n" if $prev_output != $curr_output;
+
+    s/$demangled_string_regex/std::string/g;
+
+    if (m/^(==\d+== +)((?:by|at) 0x(?:[A-F]|\d)+: )(.+?)(?: \((.*)\))?$/) {
+        my ($separator, $address, $func, $location) = ($1, $2, $3, $4);
+
+        print $separator, BOLD YELLOW $address;
+
+        if ($func =~ m/^$cpp_function_signature$/) {
+            my %func = %+;
+
+            my $clean_func = remove_template($func, $allocator_regex);
+
+            if (defined $func{NAME}) {
+                $clean_func =~ s/$func{NAME}(?=\s*[(<])/BOLD.CYAN.$&.RESET/e;
+            }
+
+            if (defined $func{NAMESPACE}) {
+                $clean_func =~ s/$func{NAMESPACE}/BRIGHT_WHITE.$&.RESET/e;
+            }
+
+            if (defined $func{QUALIFIER}) {
+                $clean_func =~ s/$func{QUALIFIER}*$/BOLD.GREEN.$&.RESET/e;
+            }
+
+            print $clean_func;
+        }
+        elsif ($func =~ m/^[A-Za-z_][A-Za-z0-9_.]*$/) {
+            print BOLD BRIGHT_BLUE $func;
+        }
+        else { # if ($func eq "???") {
+            print ON_BRIGHT_RED $func;
+        }
+
+        print " ";
+
+        if (defined $location) {
+            print "(";
+            if ($location =~ m/^(.+):([0-9]+$)/) {
+                my ($file, $line) = ($1, $2);
+                print BOLD WHITE $file, ":", MAGENTA $line;
+            }
+            elsif ($location =~ m/^(in\s+)(.*\.(?:a|so|dylib|dll))$/) {
+                my ($prefix, $lib) = ($1, $2);
+                print BOLD WHITE $prefix, BOLD BRIGHT_RED $lib;
+            }
+            print ")";
+        }
+
+        print "\n";
+    }
+    elsif (m/^(==\d+== )(.+?:)(.*)$/) {
+        my ($separator, $item, $text) = ($1, $2, $3);
+
+        print $separator;
+
+        if ($item =~ m/^[A-Z ]+:$/) {
+            print BOLD GREEN $item;
+        } else {
+            print BRIGHT_GREEN $item;
+        }
+
+        $text =~ s/[0-9][0-9,\.]*/BOLD.MAGENTA.$&.RESET/ge;
+
+        print $text, "\n";
+    }
+    elsif (m/^(==\d+== )(\S.+)$/) {
+        print $1, ON_RED $2, RESET, "\n";
+    }
+    elsif (m/^(==\d+==  )(\S.+)$/) {
+        print $1, ON_MAGENTA $2, RESET, "\n";
+    }
+    elsif (m/^(==\d+== )(\s*)$/) {
+        print $1, $2;
+    }
+    else {
+        print $_;
+    }
+}
+
+close VALGRIND;
+
+################################################################################
+##                                  AUXILIARS                                 ##
+################################################################################
+
+sub remove_template {
+    my $text = shift;
+    my $pattern = shift;
+
+    # print STDERR "> INPUT: ", $text, "\n\n";
+
+    my %templates = ();
+
+    my @types = $text =~ m/^$cpp_function_signature$/;
+    @types = grep { defined $_ and $_ !~ m/^\s*$/ } @types;
+
+    my %function_parts = %+;
+
+    my @queue = ();
+    for my $attr (qw(RETURN_TYPE TEMPLATE_TYPE_LIST PARAMETER_TYPE_LIST)) {
+        if (defined $function_parts{$attr}) {
+            push(@queue, [ 0, $function_parts{$attr} ])
+        }
+    }
+
+    while (@queue) {
+        my $pair = shift @queue;
+        my ($count, $string) = @$pair;
+
+        $string =~ s/^\s+//;
+        $string =~ s/\s+$//;
+
+        # print STDERR BOLD, YELLOW, "[$count]> ", RESET, '"', $string, '"', "\n";
+
+        for my $match (grep { defined } $string =~ m/$cpp_type/g)
+        {
+            $match =~ s/^\s+//;
+            $match =~ s/\s+$//;
+
+            # print STDERR BOLD, GREEN. '     ==> ', RESET;
+
+            if ($match =~ m/^$pattern$/) {
+                # print STDERR BOLD. RED, "(MATCH) ", RESET;
+                $templates{$match} = 1;
+            }
+
+            # print STDERR $match, "\n";
+
+            next if $match =~ m/^[^<>]*$/;
+
+            $match =~ s/[^<>]*<(.*)>[^<>]*/$1/;
+
+            # print STDERR BOLD, BLUE, '         ==> ', RESET, $match, "\n";
+
+            push @queue, [ $count+1, $match ];
+        }
+
+        # print STDERR "\n";
+    }
+
+    map { $text =~ s/(?:,\s*)$_//g } sort keys %templates;
+
+    return $text;
+}
