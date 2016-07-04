@@ -143,8 +143,7 @@ my $allocator_regex = qr(std::allocator<.*>)x;
 my ($program_output, $valgrind_output) = (0, 1);
 my ($prev_output, $curr_output) = ($valgrind_output, $valgrind_output);
 
-open VALGRIND, "-|", "valgrind 2>&1 @ARGV"
-    // die "Cannot open valgrind! $!";
+open VALGRIND, "-|", "valgrind 2>&1 @ARGV" // die "Cannot open valgrind! $!";
 
 my $program   = <VALGRIND>;
 my $copyright = <VALGRIND>;
@@ -154,8 +153,7 @@ print BOLD ON_BRIGHT_BLACK $program;
 print BOLD ON_BRIGHT_BLACK $copyright;
 print BOLD ON_BRIGHT_BLACK $info;
 
-while (<VALGRIND>)
-{
+while (<VALGRIND>) {
     $prev_output = $curr_output;
     $curr_output = (m/^==\d+==/) ? $valgrind_output : $program_output;
 
