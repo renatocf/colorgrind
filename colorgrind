@@ -35,6 +35,9 @@ local $Term::ANSIColor::AUTORESET = 1;
 # Constants
 use constant COLUMNS => ( grep defined, ($ENV{COLUMNS}, `tput cols`, 80) )[0];
 
+# Automatically flushes
+$| = 1;
+
 ################################################################################
 ##                                   REGEXES                                  ##
 ################################################################################
